@@ -1,62 +1,89 @@
 import os
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext
-from llama_index.vector_stores.qdrant import QdrantVectorStore
+import faiss
+from llama_index.core import (
+    VectorStoreIndex, 
+    SimpleDirectoryReader, 
+    StorageContext, 
+    load_index_from_storage
+)
+from llama_index.vector_stores.faiss import FaissVectorStore
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.core.vector_stores import MetadataFilters, ExactMatchFilter
-import qdrant_client
 
-# 1. Setup Local LLM and Embedding Model
-llm = Ollama(model="llama3", request_timeout=300.0) # Ensure you have 'ollama run llama3' running
+# 1. Setup Local LLM and Embedding
+llm = Ollama(model="llama3", request_timeout=300.0)
 embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
-# 2. Setup Qdrant Client (Local Database)
-client = qdrant_client.QdrantClient(url="http://localhost:6333")
-vector_store = QdrantVectorStore(client=client, collection_name="hospital_data")
-storage_context = StorageContext.from_defaults(vector_store=vector_store)
+# Define where we save the FAISS indexes
+STORAGE_BASE_DIR = "./faiss_indexes"
+os.makedirs(STORAGE_BASE_DIR, exist_ok=True)
+
+def get_department_path(department: str):
+    """Returns the folder path for a specific department's index."""
+    # simple cleanup to ensure safe folder names
+    clean_dept = "".join(x for x in department if x.isalnum())
+    return os.path.join(STORAGE_BASE_DIR, clean_dept)
 
 def index_document(file_path: str, department: str):
     """
-    Reads a file, indexes it, and tags it with the specific Department.
+    Creates or updates a FAISS index SPECIFIC to that department.
     """
-    # Read the file
-    documents = SimpleDirectoryReader(input_files=[file_path]).load_data()
+    dept_path = get_department_path(department)
     
-    # Tag every chunk of this document with the department metadata
-    for doc in documents:
-        doc.metadata["department"] = department
+    # 1. Load the new document
+    documents = SimpleDirectoryReader(input_files=[file_path]).load_data()
+
+    # 2. Check if an index already exists for this department
+    if os.path.exists(dept_path):
+        # Load existing index
+        vector_store = FaissVectorStore.from_persist_dir(dept_path)
+        storage_context = StorageContext.from_defaults(
+            vector_store=vector_store, persist_dir=dept_path
+        )
+        index = load_index_from_storage(storage_context, embed_model=embed_model)
         
-    # Create index (pushes vectors to Qdrant)
-    index = VectorStoreIndex.from_documents(
-        documents,
-        storage_context=storage_context,
-        embed_model=embed_model
-    )
-    return f"Successfully indexed {os.path.basename(file_path)} for {department}."
+        # Add new document to it
+        index.insert(documents[0])
+        
+        # Save it back to disk
+        index.storage_context.persist(persist_dir=dept_path)
+    else:
+        # Create a NEW index from scratch
+        # Dimension 384 is for BAAI/bge-small-en-v1.5. 
+        # If you change embedding models, change this dimension!
+        d = 384 
+        faiss_index = faiss.IndexFlatL2(d)
+        vector_store = FaissVectorStore(faiss_index=faiss_index)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        
+        index = VectorStoreIndex.from_documents(
+            documents, 
+            storage_context=storage_context, 
+            embed_model=embed_model
+        )
+        # Save to disk
+        index.storage_context.persist(persist_dir=dept_path)
+
+    return f"Securely indexed document into {department} vault."
 
 def query_knowledge_base(query: str, department: str):
     """
-    Queries the RAG system but STRICTLY filters by Department.
+    Loads ONLY the specified department's index to answer.
     """
-    # Connect to existing index
-    index = VectorStoreIndex.from_vector_store(
-        vector_store,
-        embed_model=embed_model,
-    )
+    dept_path = get_department_path(department)
     
-    # Define strict filters: "Only show me data where department == user's department"
-    filters = MetadataFilters(
-        filters=[
-            ExactMatchFilter(key="department", value=department),
-        ]
+    if not os.path.exists(dept_path):
+        return "No secure records found for this department yet."
+
+    # Load the specific department index
+    vector_store = FaissVectorStore.from_persist_dir(dept_path)
+    storage_context = StorageContext.from_defaults(
+        vector_store=vector_store, persist_dir=dept_path
     )
-    
-    # Create Query Engine with the filter
-    query_engine = index.as_query_engine(
-        llm=llm,
-        filters=filters,
-        similarity_top_k=3
-    )
-    
+    index = load_index_from_storage(storage_context, embed_model=embed_model)
+
+    # Query
+    query_engine = index.as_query_engine(llm=llm, similarity_top_k=3)
     response = query_engine.query(query)
+    
     return str(response)

@@ -2,9 +2,9 @@ fastapi
 uvicorn
 python-multipart
 llama-index
-llama-index-vector-stores-qdrant
+llama-index-vector-stores-faiss
 llama-index-embeddings-huggingface
 llama-index-llms-ollama
-qdrant-client
+faiss-cpu
 streamlit
 requests
